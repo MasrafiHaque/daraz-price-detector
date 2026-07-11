@@ -1,167 +1,213 @@
 from flask import Flask, request, jsonify
-from playwright.sync_api import sync_playwright
+import requests
+from bs4 import BeautifulSoup
+import re
+import json
 import time
 import os
 
 app = Flask(__name__)
 
+def get_real_url(short_url):
+    """Short link থেকে আসল URL বের করা"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        resp = requests.get(short_url, headers=headers, allow_redirects=True, timeout=15)
+        final_url = resp.url
+        
+        # যদি এখনও short link থাকে, আরেকবার follow
+        if 's.daraz' in final_url:
+            resp2 = requests.get(final_url, headers=headers, allow_redirects=True, timeout=15)
+            final_url = resp2.url
+        
+        print(f"🔗 Final URL: {final_url[:80]}")
+        return final_url
+    except Exception as e:
+        print(f"Redirect error: {e}")
+        return short_url
+
 def scrape_daraz(url):
-    """Scrape Daraz product details"""
+    """Fast scrape without Playwright"""
     try:
         start_time = time.time()
-        print(f"⚡ Scraping: {url[:60]}...")
         
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-            )
-            
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                viewport={'width': 1920, 'height': 1080}
-            )
-            
-            page = context.new_page()
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            """)
-            
-            print("📄 Loading page...")
-            
-            # USE domcontentloaded instead of networkidle (FASTER)
-            page.goto(url, wait_until='domcontentloaded', timeout=20000)
-            current_url = page.url
-            
-            # Handle short links
-            if 's.daraz' in current_url:
-                print("🔄 Short link, waiting for redirect...")
-                page.wait_for_timeout(4000)
-                current_url = page.url
-            
-            # Wait for price elements to appear
-            print("⏳ Waiting for prices...")
+        # Step 1: Get real URL from short link
+        if 's.daraz' in url or 'short' in url or len(url) < 50:
+            print("🔄 Resolving short link...")
+            url = get_real_url(url)
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.google.com/',
+            'Cache-Control': 'no-cache'
+        }
+        
+        session = requests.Session()
+        session.get('https://www.daraz.com.bd/', headers=headers, timeout=10)
+        
+        print(f"📄 Fetching: {url[:80]}...")
+        response = session.get(url, headers=headers, timeout=15)
+        
+        if response.status_code == 404:
+            # Try alternative URL format
+            alt_url = url.replace('/products/', '/product/')
+            response = session.get(alt_url, headers=headers, timeout=15)
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        data = {
+            'title': 'N/A',
+            'price': 'N/A',
+            'original_price': 'N/A',
+            'discount': 'N/A',
+            'rating': 'N/A',
+            'review_count': 'N/A',
+            'brand': 'N/A',
+            'category': 'N/A',
+            'image': '',
+            'url': response.url
+        }
+        
+        # Method 1: JSON-LD Structured Data
+        for script in soup.find_all('script', type='application/ld+json'):
             try:
-                page.wait_for_selector('body', timeout=5000)
-                page.wait_for_timeout(3000)
+                if not script.string:
+                    continue
+                ld = json.loads(script.string)
+                if isinstance(ld, list):
+                    ld = ld[0] if ld else {}
                 
-                # Try to find price
-                price_found = page.evaluate("""() => {
-                    const el = document.querySelector('span.pdp-price_color_orange, span.pdp-price, .pdp-price');
-                    return el && el.textContent.trim() && /[0-9]/.test(el.textContent.trim());
-                }""")
-                
-                if not price_found:
-                    print("⚠️ Price not visible yet, extra wait...")
-                    page.wait_for_timeout(3000)
+                if ld.get('@type') == 'Product' or ld.get('name'):
+                    data['title'] = ld.get('name', data['title'])
+                    if ' | ' in data['title']:
+                        data['title'] = data['title'].split(' | ')[0].strip()
+                    
+                    # Image
+                    img = ld.get('image', '')
+                    if isinstance(img, list) and img:
+                        data['image'] = img[0]
+                    elif isinstance(img, str):
+                        data['image'] = img
+                    
+                    # Price
+                    offers = ld.get('offers', {})
+                    if isinstance(offers, dict):
+                        price = offers.get('price')
+                        if price:
+                            data['price'] = f'৳{price}'
+                    
+                    # Brand
+                    brand = ld.get('brand', {})
+                    if isinstance(brand, dict):
+                        data['brand'] = brand.get('name', data['brand'])
+                    elif isinstance(brand, str):
+                        data['brand'] = brand
+                    
+                    print(f"✅ JSON-LD: {data['title'][:50]}")
+                    break
             except:
-                page.wait_for_timeout(3000)
-            
-            # Extract data
-            data = page.evaluate("""() => {
-                const getText = (selectors) => {
-                    for (let sel of selectors) {
-                        const els = document.querySelectorAll(sel);
-                        for (let el of els) {
-                            const text = el.textContent.trim();
-                            if (text && text.length > 0) return text;
-                        }
-                    }
-                    return null;
-                };
-                
-                // Title
-                let title = getText(['h1.pdp-mod-product-badge-title', 'h1.pdp-product-title', 'h1']);
-                if (!title) {
-                    const meta = document.querySelector('meta[property="og:title"]');
-                    if (meta) title = meta.content;
-                }
-                if (title && title.includes(' | ')) title = title.split(' | ')[0].trim();
-                
-                // Price
-                let price = null;
-                for (let sel of ['span.pdp-price_color_orange', 'span.pdp-price', '.pdp-price', 'div.pdp-product-price span']) {
-                    const els = document.querySelectorAll(sel);
-                    for (let el of els) {
-                        const t = el.textContent.trim();
-                        if (t && /[0-9]/.test(t) && t.length < 20) { price = t; break; }
-                    }
-                    if (price) break;
-                }
-                
-                if (!price) {
-                    const spans = document.querySelectorAll('span, div');
-                    for (let el of spans) {
-                        const t = el.textContent.trim();
-                        if (t && /[0-9]/.test(t) && t.length < 15) {
-                            const style = window.getComputedStyle(el);
-                            if (parseFloat(style.fontSize) >= 16 || style.color.includes('245') || t.includes('৳')) {
-                                price = t;
-                                break;
-                            }
-                        }
-                    }
-                }
-                
-                if (!price) {
-                    const text = document.body.innerText;
-                    const matches = text.match(/[৳TK]\s*[0-9,]+/g);
-                    if (matches) {
-                        const nums = [...new Set(matches.map(m => parseFloat(m.replace(/[^0-9.]/g, ''))))].sort((a,b) => a-b);
-                        if (nums.length > 0) price = '৳' + nums[0];
-                    }
-                }
-                
-                // Original Price
-                let origPrice = getText(['span.pdp-price_color_lightgray', 'del.pdp-price', 'del']);
-                
-                // Discount
-                let discount = getText(['span.pdp-product-price__discount', '.discount']);
-                if (!discount && price && origPrice) {
-                    const p = parseFloat(price.replace(/[^0-9.]/g, ''));
-                    const o = parseFloat(origPrice.replace(/[^0-9.]/g, ''));
-                    if (p && o && o > p) discount = '-' + Math.round((1-p/o)*100) + '%';
-                }
-                
-                // Brand
-                let brand = getText(['a.pdp-product-brand', '.pdp-product-brand']);
-                if (brand) { brand = brand.replace(/^Brand:\\s*/i, '').split('More')[0].trim(); }
-                
-                // Rating & Reviews
-                let rating = getText(['span.pdp-review-summary__average', '.rating-value']);
-                let reviews = getText(['span.pdp-review-summary__count']);
-                if (reviews) reviews = reviews.replace(/[^0-9]/g, '');
-                
-                // Category
-                let category = null;
-                const bc = document.querySelectorAll('a.pdp-mod-product-breadcrumb-link');
-                if (bc.length) category = bc[bc.length-1].textContent.trim();
-                
-                // Image
-                let image = '';
-                const mi = document.querySelector('meta[property="og:image"]');
-                if (mi) image = mi.content;
-                if (!image) {
-                    const img = document.querySelector('img.pdp-mod-common-image, .pdp-product-img img');
-                    if (img) image = img.src;
-                }
-                
-                return {
-                    title: title || 'N/A', price: price || 'N/A',
-                    original_price: origPrice || 'N/A', discount: discount || 'N/A',
-                    rating: rating || 'N/A', review_count: reviews || 'N/A',
-                    brand: brand || 'N/A', category: category || 'N/A', image: image
-                };
-            }""")
-            
-            browser.close()
-            elapsed = time.time() - start_time
-            data['url'] = current_url
-            print(f"✅ {elapsed:.1f}s | Price: {data.get('price')}")
-            return data
-            
+                continue
+        
+        # Method 2: Meta Tags
+        if data['title'] == 'N/A':
+            meta_title = soup.select_one('meta[property="og:title"]')
+            if meta_title:
+                title = meta_title.get('content', '')
+                if ' | ' in title:
+                    title = title.split(' | ')[0].strip()
+                data['title'] = title
+        
+        if not data['image']:
+            meta_img = soup.select_one('meta[property="og:image"]')
+            if meta_img:
+                data['image'] = meta_img.get('content', '')
+        
+        # Method 3: CSS Selectors
+        if data['price'] == 'N/A':
+            for sel in ['span.pdp-price_color_orange', 'span.pdp-price', '.pdp-price']:
+                elem = soup.select_one(sel)
+                if elem:
+                    text = elem.get_text(strip=True)
+                    if text and re.search(r'\d', text):
+                        data['price'] = text
+                        break
+        
+        if data['price'] == 'N/A':
+            # Find any span with TK symbol
+            all_text = soup.get_text()
+            matches = re.findall(r'[৳TK]\s*[\d,]+', all_text)
+            if matches:
+                nums = sorted(set(float(re.sub(r'[^\d.]', '', m)) for m in matches))
+                if nums:
+                    data['price'] = f'৳{int(nums[0])}'
+        
+        # Original Price
+        for sel in ['span.pdp-price_color_lightgray', 'del.pdp-price', 'del']:
+            elem = soup.select_one(sel)
+            if elem:
+                data['original_price'] = elem.get_text(strip=True)
+                break
+        
+        # Discount
+        for sel in ['span.pdp-product-price__discount', '.discount']:
+            elem = soup.select_one(sel)
+            if elem:
+                data['discount'] = elem.get_text(strip=True)
+                break
+        
+        if data['discount'] == 'N/A' and data['price'] != 'N/A' and data['original_price'] != 'N/A':
+            try:
+                p = float(re.sub(r'[^\d.]', '', data['price']))
+                o = float(re.sub(r'[^\d.]', '', data['original_price']))
+                if o > p:
+                    data['discount'] = f"-{round((1-p/o)*100)}%"
+            except:
+                pass
+        
+        # Rating
+        for sel in ['span.pdp-review-summary__average', '.rating-value']:
+            elem = soup.select_one(sel)
+            if elem:
+                data['rating'] = elem.get_text(strip=True)
+                break
+        
+        # Review Count
+        for sel in ['span.pdp-review-summary__count', '.review-count']:
+            elem = soup.select_one(sel)
+            if elem:
+                data['review_count'] = re.sub(r'[^\d]', '', elem.get_text(strip=True))
+                break
+        
+        # Brand
+        if data['brand'] == 'N/A':
+            for sel in ['a.pdp-product-brand', '.pdp-product-brand']:
+                elem = soup.select_one(sel)
+                if elem:
+                    brand = elem.get_text(strip=True)
+                    brand = re.sub(r'^Brand:\s*', '', brand)
+                    brand = brand.split('More')[0].strip()
+                    data['brand'] = brand[:30] if len(brand) > 30 else brand
+                    break
+        
+        # Category
+        breadcrumbs = soup.select('a.pdp-mod-product-breadcrumb-link, .breadcrumb a')
+        if breadcrumbs:
+            data['category'] = breadcrumbs[-1].get_text(strip=True)
+        
+        elapsed = time.time() - start_time
+        print(f"✅ {elapsed:.1f}s | Price: {data['price']} | {data['discount']}")
+        
+        return data
+        
     except Exception as e:
         print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         return {'error': str(e)}
 
 
@@ -180,20 +226,19 @@ def home():
         .container{max-width:650px;margin:0 auto}
         .header{text-align:center;margin-bottom:25px;color:#fff}
         .header h1{font-size:28px;text-shadow:2px 2px 4px rgba(0,0,0,.2)}
-        .header p{font-size:14px;opacity:.9;margin-top:5px}
         .search-box{background:#fff;padding:20px;border-radius:15px;box-shadow:0 10px 40px rgba(0,0,0,.15);margin-bottom:20px}
         .input-row{display:flex;gap:10px}
         input{flex:1;padding:14px 18px;border:2px solid #e0e0e0;border-radius:10px;font-size:14px}
-        input:focus{outline:none;border-color:#f57224;box-shadow:0 0 0 3px rgba(245,114,36,.1)}
+        input:focus{outline:none;border-color:#f57224}
         button{padding:14px 25px;background:linear-gradient(135deg,#f57224,#ff6b35);color:#fff;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;white-space:nowrap}
-        button:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(245,114,36,.4)}
-        .quick-links{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+        button:hover{transform:translateY(-2px)}
+        .quick-links{margin-top:12px;display:flex;gap:8px;flex-wrap:wrap}
         .quick-btn{background:#f5f5f5;border:1px solid #ddd;padding:6px 14px;border-radius:20px;font-size:12px;cursor:pointer}
-        .quick-btn:hover{background:#f57224;color:#fff;border-color:#f57224}
+        .quick-btn:hover{background:#f57224;color:#fff}
         .loading{text-align:center;padding:30px;display:none;color:#fff}
         .spinner{border:4px solid rgba(255,255,255,.3);border-top:4px solid #fff;border-radius:50%;width:45px;height:45px;animation:spin .8s linear infinite;margin:0 auto 15px}
         @keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-        .error{background:#fff0f0;border-left:4px solid #f44;padding:15px 20px;border-radius:10px;display:none;margin-bottom:20px;color:#d00}
+        .error{background:#fff0f0;border-left:4px solid #f44;padding:15px;border-radius:10px;display:none;margin-bottom:20px;color:#d00}
         .product{display:none;animation:slideUp .5s ease}
         @keyframes slideUp{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
         .product-card{background:#fff;border-radius:15px;box-shadow:0 10px 40px rgba(0,0,0,.15);overflow:hidden}
@@ -202,34 +247,28 @@ def home():
         .disc-badge{position:absolute;top:15px;right:15px;background:#f44;color:#fff;padding:8px 15px;border-radius:25px;font-weight:700;font-size:14px;display:none}
         .details{padding:25px}
         .brand{color:#f57224;font-weight:600;font-size:14px;margin-bottom:8px}
-        .title{font-size:20px;font-weight:700;color:#333;margin-bottom:15px;line-height:1.5}
+        .title{font-size:20px;font-weight:700;color:#333;margin-bottom:15px}
         .price-box{background:#fff5f0;padding:18px;border-radius:12px;margin-bottom:15px;display:flex;align-items:center;flex-wrap:wrap;gap:12px}
         .price{font-size:32px;font-weight:700;color:#f57224}
         .orig-price{color:#999;text-decoration:line-through;font-size:16px;display:none}
         .disc-text{color:#f44;font-weight:700;font-size:15px;display:none}
         .stats{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-bottom:15px}
         .stat{background:#f8f9fa;padding:12px;border-radius:10px;text-align:center}
-        .stat-label{font-size:10px;color:#888;margin-bottom:5px}
+        .stat-label{font-size:10px;color:#888}
         .stat-value{font-size:14px;font-weight:700;color:#333}
         .buy-btn{display:block;text-align:center;background:linear-gradient(135deg,#f57224,#ff6b35);color:#fff;padding:16px;border-radius:12px;text-decoration:none;font-size:17px;font-weight:700}
-        .buy-btn:hover{transform:translateY(-2px);box-shadow:0 5px 20px rgba(245,114,36,.4)}
         .time{text-align:center;margin-top:10px;font-size:12px;color:#888}
-        @media(max-width:600px){.stats{grid-template-columns:1fr 1fr}.price{font-size:24px}}
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🛍️ Daraz Product Viewer</h1>
-            <p>Paste any Daraz link & get full product details</p>
-        </div>
+        <div class="header"><h1>🛍️ Daraz Product Viewer</h1></div>
         <div class="search-box">
             <div class="input-row">
                 <input type="text" id="urlInput" placeholder="Paste Daraz link..." autofocus>
                 <button onclick="searchProduct()">🔍 Search</button>
             </div>
             <div class="quick-links">
-                <span style="font-size:12px;color:#888">Quick:</span>
                 <button class="quick-btn" onclick="quickSearch('https://s.daraz.com.bd/s.bMhlC?cc')">⌚ Watch</button>
                 <button class="quick-btn" onclick="quickSearch('https://www.daraz.com.bd/products/realme-c55-8gb-256gb-i405584532.html')">📱 Phone</button>
             </div>
