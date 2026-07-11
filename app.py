@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from playwright.sync_api import sync_playwright
 import time
+import os
 
 app = Flask(__name__)
 
