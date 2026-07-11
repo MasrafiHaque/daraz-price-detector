@@ -18,47 +18,46 @@ def scrape_daraz(url):
             )
             
             context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                viewport={'width': 1920, 'height': 1080},
-                locale='en-US'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                viewport={'width': 1920, 'height': 1080}
             )
             
             page = context.new_page()
-            
-            # Anti-detection
             page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.navigator.chrome = { runtime: {} };
             """)
             
             print("📄 Loading page...")
             
-            # Load with full wait
-            page.goto(url, wait_until='networkidle', timeout=30000)
+            # USE domcontentloaded instead of networkidle (FASTER)
+            page.goto(url, wait_until='domcontentloaded', timeout=20000)
             current_url = page.url
             
-            # Handle short/affiliate links
-            if 's.daraz' in current_url or 'short' in current_url:
-                print("🔄 Short link detected, waiting for redirect...")
-                page.wait_for_timeout(5000)
+            # Handle short links
+            if 's.daraz' in current_url:
+                print("🔄 Short link, waiting for redirect...")
+                page.wait_for_timeout(4000)
                 current_url = page.url
-                if 's.daraz' in current_url:
-                    page.goto(current_url, wait_until='networkidle', timeout=30000)
-                    current_url = page.url
             
-            # Wait for JavaScript to render prices
-            print("⏳ Waiting for product data...")
-            page.wait_for_timeout(5000)
-            
-            # Wait for price element
+            # Wait for price elements to appear
+            print("⏳ Waiting for prices...")
             try:
-                page.wait_for_selector('span.pdp-price, span.pdp-price_color_orange, .pdp-price, h1', timeout=10000)
-                print("✅ Product elements found!")
+                page.wait_for_selector('body', timeout=5000)
+                page.wait_for_timeout(3000)
+                
+                # Try to find price
+                price_found = page.evaluate("""() => {
+                    const el = document.querySelector('span.pdp-price_color_orange, span.pdp-price, .pdp-price');
+                    return el && el.textContent.trim() && /[0-9]/.test(el.textContent.trim());
+                }""")
+                
+                if not price_found:
+                    print("⚠️ Price not visible yet, extra wait...")
+                    page.wait_for_timeout(3000)
             except:
-                print("⚠️ Timeout, extracting anyway...")
                 page.wait_for_timeout(3000)
             
-            # Extract ALL data
+            # Extract data
             data = page.evaluate("""() => {
                 const getText = (selectors) => {
                     for (let sel of selectors) {
@@ -72,62 +71,38 @@ def scrape_daraz(url):
                 };
                 
                 // Title
-                let title = getText([
-                    'h1.pdp-mod-product-badge-title',
-                    'h1.pdp-product-title',
-                    'div.pdp-product-title h1',
-                    'h1'
-                ]);
+                let title = getText(['h1.pdp-mod-product-badge-title', 'h1.pdp-product-title', 'h1']);
                 if (!title) {
                     const meta = document.querySelector('meta[property="og:title"]');
                     if (meta) title = meta.content;
                 }
-                if (title && title.includes(' | ')) {
-                    title = title.split(' | ')[0].trim();
-                }
+                if (title && title.includes(' | ')) title = title.split(' | ')[0].trim();
                 
-                // PRICE - 3 Methods
+                // Price
                 let price = null;
-                
-                // Method 1: CSS Selectors
-                for (let sel of [
-                    'span.pdp-price_color_orange',
-                    'span.pdp-price',
-                    '.pdp-price',
-                    'div.pdp-product-price span'
-                ]) {
+                for (let sel of ['span.pdp-price_color_orange', 'span.pdp-price', '.pdp-price', 'div.pdp-product-price span']) {
                     const els = document.querySelectorAll(sel);
                     for (let el of els) {
                         const t = el.textContent.trim();
-                        if (t && /[0-9]/.test(t) && t.length < 20) {
-                            price = t;
-                            break;
-                        }
+                        if (t && /[0-9]/.test(t) && t.length < 20) { price = t; break; }
                     }
                     if (price) break;
                 }
                 
-                // Method 2: Find by color & font size
                 if (!price) {
                     const spans = document.querySelectorAll('span, div');
-                    let best = null, bestScore = 0;
                     for (let el of spans) {
                         const t = el.textContent.trim();
                         if (t && /[0-9]/.test(t) && t.length < 15) {
                             const style = window.getComputedStyle(el);
-                            const size = parseFloat(style.fontSize);
-                            const color = style.color;
-                            let score = 0;
-                            if (color.includes('245') || color.includes('orange') || color.includes('red')) score += 5;
-                            if (size >= 18) score += 3;
-                            if (t.includes('৳') || t.includes('TK')) score += 2;
-                            if (score > bestScore) { bestScore = score; best = t; }
+                            if (parseFloat(style.fontSize) >= 16 || style.color.includes('245') || t.includes('৳')) {
+                                price = t;
+                                break;
+                            }
                         }
                     }
-                    if (best) price = best;
                 }
                 
-                // Method 3: Scan page text for TK amounts
                 if (!price) {
                     const text = document.body.innerText;
                     const matches = text.match(/[৳TK]\s*[0-9,]+/g);
@@ -138,101 +113,55 @@ def scrape_daraz(url):
                 }
                 
                 // Original Price
-                let origPrice = getText([
-                    'span.pdp-price_color_lightgray',
-                    'del.pdp-price',
-                    'span.pdp-price_original',
-                    'del',
-                    'span[style*="line-through"]'
-                ]);
+                let origPrice = getText(['span.pdp-price_color_lightgray', 'del.pdp-price', 'del']);
                 
                 // Discount
-                let discount = getText([
-                    'span.pdp-product-price__discount',
-                    '.pdp-product-price__discount',
-                    '.discount',
-                    'span[class*="discount"]'
-                ]);
-                
-                // Calculate discount if not found
+                let discount = getText(['span.pdp-product-price__discount', '.discount']);
                 if (!discount && price && origPrice) {
                     const p = parseFloat(price.replace(/[^0-9.]/g, ''));
                     const o = parseFloat(origPrice.replace(/[^0-9.]/g, ''));
-                    if (p && o && o > p) {
-                        discount = '-' + Math.round((1 - p/o) * 100) + '%';
-                    }
+                    if (p && o && o > p) discount = '-' + Math.round((1-p/o)*100) + '%';
                 }
                 
                 // Brand
-                let brand = getText([
-                    'a.pdp-product-brand',
-                    'span.pdp-product-brand__name',
-                    '.pdp-product-brand a',
-                    '.pdp-product-brand'
-                ]);
-                if (brand) {
-                    brand = brand.replace(/^Brand:\s*/i, '');
-                    brand = brand.split('More')[0].trim();
-                    if (brand.length > 30) brand = brand.substring(0, 30);
-                }
+                let brand = getText(['a.pdp-product-brand', '.pdp-product-brand']);
+                if (brand) { brand = brand.replace(/^Brand:\\s*/i, '').split('More')[0].trim(); }
                 
-                // Rating
-                let rating = getText([
-                    'span.pdp-review-summary__average',
-                    '.pdp-review-summary__average',
-                    '.rating-value',
-                    'div[class*="rating"] span'
-                ]);
+                // Rating & Reviews
+                let rating = getText(['span.pdp-review-summary__average', '.rating-value']);
+                let reviews = getText(['span.pdp-review-summary__count']);
+                if (reviews) reviews = reviews.replace(/[^0-9]/g, '');
                 
-                // Review Count
-                let reviewCount = getText([
-                    'span.pdp-review-summary__count',
-                    '.pdp-review-summary__count',
-                    '.review-count'
-                ]);
-                if (reviewCount) reviewCount = reviewCount.replace(/[^0-9]/g, '');
-                
-                // Category from breadcrumb
+                // Category
                 let category = null;
-                const breadcrumbs = document.querySelectorAll('a.pdp-mod-product-breadcrumb-link, .breadcrumb a');
-                if (breadcrumbs.length > 0) {
-                    category = breadcrumbs[breadcrumbs.length - 1].textContent.trim();
-                }
+                const bc = document.querySelectorAll('a.pdp-mod-product-breadcrumb-link');
+                if (bc.length) category = bc[bc.length-1].textContent.trim();
                 
                 // Image
                 let image = '';
-                const metaImg = document.querySelector('meta[property="og:image"]');
-                if (metaImg && metaImg.content) image = metaImg.content;
+                const mi = document.querySelector('meta[property="og:image"]');
+                if (mi) image = mi.content;
                 if (!image) {
-                    const img = document.querySelector('img.pdp-mod-common-image, .pdp-product-img img, .gallery-preview-panel img');
-                    if (img && img.src) image = img.src;
+                    const img = document.querySelector('img.pdp-mod-common-image, .pdp-product-img img');
+                    if (img) image = img.src;
                 }
                 
                 return {
-                    title: title || 'N/A',
-                    price: price || 'N/A',
-                    original_price: origPrice || 'N/A',
-                    discount: discount || 'N/A',
-                    rating: rating || 'N/A',
-                    review_count: reviewCount || 'N/A',
-                    brand: brand || 'N/A',
-                    category: category || 'N/A',
-                    image: image
+                    title: title || 'N/A', price: price || 'N/A',
+                    original_price: origPrice || 'N/A', discount: discount || 'N/A',
+                    rating: rating || 'N/A', review_count: reviews || 'N/A',
+                    brand: brand || 'N/A', category: category || 'N/A', image: image
                 };
             }""")
             
             browser.close()
-            
             elapsed = time.time() - start_time
             data['url'] = current_url
-            
-            print(f"✅ {elapsed:.1f}s | Price: {data.get('price')} | Discount: {data.get('discount')}")
+            print(f"✅ {elapsed:.1f}s | Price: {data.get('price')}")
             return data
             
     except Exception as e:
         print(f"❌ Error: {e}")
-        import traceback
-        traceback.print_exc()
         return {'error': str(e)}
 
 
@@ -296,7 +225,7 @@ def home():
         </div>
         <div class="search-box">
             <div class="input-row">
-                <input type="text" id="urlInput" placeholder="Paste Daraz product or affiliate link..." autofocus>
+                <input type="text" id="urlInput" placeholder="Paste Daraz link..." autofocus>
                 <button onclick="searchProduct()">🔍 Search</button>
             </div>
             <div class="quick-links">
@@ -305,7 +234,7 @@ def home():
                 <button class="quick-btn" onclick="quickSearch('https://www.daraz.com.bd/products/realme-c55-8gb-256gb-i405584532.html')">📱 Phone</button>
             </div>
         </div>
-        <div class="loading" id="loading"><div class="spinner"></div><p>Loading product details...</p></div>
+        <div class="loading" id="loading"><div class="spinner"></div><p>Loading...</p></div>
         <div class="error" id="error"></div>
         <div class="product" id="product">
             <div class="product-card">
@@ -336,29 +265,7 @@ def home():
     <script>
         async function searchProduct(){const e=document.getElementById("urlInput").value.trim();e&&fetchProduct(e)}
         function quickSearch(e){document.getElementById("urlInput").value=e,fetchProduct(e)}
-        async function fetchProduct(e){
-            const t=Date.now();
-            document.getElementById("loading").style.display="block";
-            document.getElementById("product").style.display="none";
-            document.getElementById("error").style.display="none";
-            try{
-                const o=await fetch("/api/product?url="+encodeURIComponent(e)),n=await o.json(),l=((Date.now()-t)/1e3).toFixed(1);
-                document.getElementById("loading").style.display="none";
-                if(n.error){document.getElementById("error").textContent="❌ "+n.error;document.getElementById("error").style.display="block";return}
-                n.image?(document.getElementById("pImg").src=n.image,document.getElementById("pImg").style.display="block"):document.getElementById("pImg").style.display="none";
-                document.getElementById("pTitle").textContent=n.title||"N/A";
-                document.getElementById("pPrice").textContent=n.price||"N/A";
-                document.getElementById("pBuy").href=n.url||e;
-                document.getElementById("pTime").textContent="⚡ "+l+"s";
-                n.brand&&"N/A"!==n.brand?(document.getElementById("pBrand").textContent="🏷️ "+n.brand,document.getElementById("pBrandVal").textContent=n.brand):(document.getElementById("pBrand").textContent="",document.getElementById("pBrandVal").textContent="-");
-                document.getElementById("pRating").textContent="N/A"!==n.rating?"⭐ "+n.rating:"-";
-                document.getElementById("pReviews").textContent="N/A"!==n.review_count?n.review_count:"0";
-                document.getElementById("pCategory").textContent="N/A"!==n.category?n.category:"-";
-                n.original_price&&"N/A"!==n.original_price&&n.original_price!==n.price?(document.getElementById("pOrig").textContent=n.original_price,document.getElementById("pOrig").style.display="inline"):document.getElementById("pOrig").style.display="none";
-                n.discount&&"N/A"!==n.discount?(document.getElementById("pDisc").textContent="🔥 "+n.discount,document.getElementById("pDisc").style.display="inline",document.getElementById("pDiscBadge").textContent=n.discount,document.getElementById("pDiscBadge").style.display="block"):(document.getElementById("pDisc").style.display="none",document.getElementById("pDiscBadge").style.display="none");
-                document.getElementById("product").style.display="block"
-            }catch(o){document.getElementById("loading").style.display="none",document.getElementById("error").textContent="❌ "+o.message,document.getElementById("error").style.display="block"}
-        }
+        async function fetchProduct(e){const t=Date.now();document.getElementById("loading").style.display="block";document.getElementById("product").style.display="none";document.getElementById("error").style.display="none";try{const o=await fetch("/api/product?url="+encodeURIComponent(e)),n=await o.json(),l=((Date.now()-t)/1e3).toFixed(1);document.getElementById("loading").style.display="none";if(n.error){document.getElementById("error").textContent="❌ "+n.error;document.getElementById("error").style.display="block";return}n.image?(document.getElementById("pImg").src=n.image,document.getElementById("pImg").style.display="block"):document.getElementById("pImg").style.display="none";document.getElementById("pTitle").textContent=n.title||"N/A";document.getElementById("pPrice").textContent=n.price||"N/A";document.getElementById("pBuy").href=n.url||e;document.getElementById("pTime").textContent="⚡ "+l+"s";n.brand&&"N/A"!==n.brand?(document.getElementById("pBrand").textContent="🏷️ "+n.brand,document.getElementById("pBrandVal").textContent=n.brand):(document.getElementById("pBrand").textContent="",document.getElementById("pBrandVal").textContent="-");document.getElementById("pRating").textContent="N/A"!==n.rating?"⭐ "+n.rating:"-";document.getElementById("pReviews").textContent="N/A"!==n.review_count?n.review_count:"0";document.getElementById("pCategory").textContent="N/A"!==n.category?n.category:"-";n.original_price&&"N/A"!==n.original_price&&n.original_price!==n.price?(document.getElementById("pOrig").textContent=n.original_price,document.getElementById("pOrig").style.display="inline"):document.getElementById("pOrig").style.display="none";n.discount&&"N/A"!==n.discount?(document.getElementById("pDisc").textContent="🔥 "+n.discount,document.getElementById("pDisc").style.display="inline",document.getElementById("pDiscBadge").textContent=n.discount,document.getElementById("pDiscBadge").style.display="block"):(document.getElementById("pDisc").style.display="none",document.getElementById("pDiscBadge").style.display="none");document.getElementById("product").style.display="block"}catch(o){document.getElementById("loading").style.display="none",document.getElementById("error").textContent="❌ "+o.message,document.getElementById("error").style.display="block"}}
         document.getElementById("urlInput").addEventListener("keypress",function(e){"Enter"===e.key&&searchProduct()});
     </script>
 </body>
@@ -369,21 +276,11 @@ def home():
 @app.route('/api/product')
 def api_product():
     url = request.args.get('url', '')
-    if not url:
-        return jsonify({'error': 'URL required'}), 400
-    if 'daraz' not in url.lower():
-        return jsonify({'error': 'Daraz links only'}), 400
-    
-    result = scrape_daraz(url)
-    return jsonify(result)
-
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok'})
+    if not url: return jsonify({'error': 'URL required'}), 400
+    if 'daraz' not in url.lower(): return jsonify({'error': 'Daraz links only'}), 400
+    return jsonify(scrape_daraz(url))
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"🚀 Server running on port {port}")
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
