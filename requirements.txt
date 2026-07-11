@@ -1,4 +1,4 @@
-flask==3.0.3
-flask-cors==6.0.0
+flask
+flask-cors
 playwright==1.48.0
-gunicorn==21.2.0
+gunicorn
