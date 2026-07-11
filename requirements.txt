@@ -1,5 +1,4 @@
 flask
 flask-cors
-requests
-beautifulsoup4
+playwright==1.48.0
 gunicorn
