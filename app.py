@@ -1,30 +1,69 @@
 from flask import Flask, request, jsonify
-from playwright.sync_api import sync_playwright
 import time
 import os
+import glob
 
 app = Flask(__name__)
 
+# ============================================
+# PLAYWRIGHT SETUP FOR RENDER
+# ============================================
+def find_chromium():
+    """Find Chromium executable for Render/Production"""
+    possible_paths = [
+        '/opt/render/.cache/ms-playwright/chromium-1140/chrome-linux/chrome',
+        '/opt/render/.cache/ms-playwright/chromium-1150/chrome-linux/chrome',
+        '/opt/render/.cache/ms-playwright/chromium-1130/chrome-linux/chrome',
+        os.path.expanduser('~/.cache/ms-playwright/chromium-1140/chrome-linux/chrome'),
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            return path
+    
+    # Search for any chromium installation
+    search_patterns = glob.glob('/opt/render/.cache/ms-playwright/chromium-*/chrome-linux/chrome')
+    if search_patterns:
+        return search_patterns[0]
+    
+    # Fallback
+    return None
+
+# ============================================
+# DARAZ PRODUCT SCRAPER
+# ============================================
 def scrape_daraz(url):
-    """Daraz Product Scraper - Full Featured"""
+    """Scrape Daraz product details using Playwright"""
     try:
         start_time = time.time()
-        print(f"\n{'='*50}")
-        print(f"⚡ Scraping: {url[:70]}...")
-        print(f"{'='*50}")
+        print(f"\n⚡ Scraping: {url[:70]}...")
+        
+        # Find Chromium
+        chromium_path = find_chromium()
+        if chromium_path:
+            print(f"✅ Chromium: {chromium_path}")
+        else:
+            print("⚠️ Using default Chromium path")
+        
+        from playwright.sync_api import sync_playwright
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
+            # Launch browser
+            launch_options = {
+                'headless': True,
+                'args': [
                     '--no-sandbox',
+                    '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
-                    '--disable-extensions',
-                    '--mute-audio'
+                    '--disable-blink-features=AutomationControlled'
                 ]
-            )
+            }
+            
+            if chromium_path and os.path.exists(chromium_path):
+                launch_options['executable_path'] = chromium_path
+            
+            browser = p.chromium.launch(**launch_options)
             
             context = browser.new_context(
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -42,21 +81,18 @@ def scrape_daraz(url):
             
             print("📄 Loading page...")
             
-            # Go to URL
+            # Load page
             page.goto(url, wait_until='domcontentloaded', timeout=20000)
             
-            # Handle short/affiliate link redirect
+            # Handle short links
             current_url = page.url
-            if 's.daraz' in current_url or 'short' in current_url or 's.' in current_url[:10]:
+            if 's.daraz' in current_url or 'short' in current_url:
                 print("🔄 Short link detected, waiting for redirect...")
                 page.wait_for_timeout(3000)
                 current_url = page.url
-                print(f"📍 Redirected to: {current_url[:80]}...")
             
-            # Wait for price to load (multiple attempts)
+            # Wait for price to load
             print("⏳ Waiting for product data...")
-            price_loaded = False
-            
             for attempt in range(5):
                 try:
                     has_price = page.evaluate("""() => {
@@ -76,7 +112,6 @@ def scrape_daraz(url):
                     }""")
                     
                     if has_price:
-                        price_loaded = True
                         print(f"✅ Price found after {attempt + 1} attempt(s)")
                         break
                     else:
@@ -84,12 +119,8 @@ def scrape_daraz(url):
                 except:
                     page.wait_for_timeout(1000)
             
-            if not price_loaded:
-                print("⚠️ Price element not found via selectors, trying text extraction...")
-            
             # Extract ALL product data
             data = page.evaluate("""() => {
-                // Helper function
                 const getText = (selectors) => {
                     for (let sel of selectors) {
                         const el = document.querySelector(sel);
@@ -100,7 +131,7 @@ def scrape_daraz(url):
                     return null;
                 };
                 
-                // ===== TITLE =====
+                // Title
                 let title = getText([
                     'h1.pdp-mod-product-badge-title',
                     'h1.pdp-product-title',
@@ -113,15 +144,13 @@ def scrape_daraz(url):
                     if (meta) title = meta.content;
                 }
                 
-                // Clean title (remove "| Daraz.com.bd")
                 if (title && title.includes(' | ')) {
                     title = title.split(' | ')[0].trim();
                 }
                 
-                // ===== PRICE (Multiple methods) =====
+                // Price - Multiple methods
                 let price = null;
                 
-                // Method 1: Standard CSS selectors
                 const priceSelectors = [
                     'span.pdp-price_color_orange',
                     'span.pdp-price',
@@ -142,7 +171,7 @@ def scrape_daraz(url):
                     if (price) break;
                 }
                 
-                // Method 2: Find by color (orange/red) and font size
+                // Method 2: Find by color and font size
                 if (!price) {
                     const allElements = document.querySelectorAll('span, div');
                     let bestCandidate = null;
@@ -156,16 +185,13 @@ def scrape_daraz(url):
                             const color = style.color;
                             
                             let score = 0;
-                            // Orange color = high score
                             if (color.includes('245, 114') || color.includes('245, 87') || 
                                 color.includes('255, 114') || color.includes('255, 87') ||
                                 color.includes('orange')) {
                                 score += 5;
                             }
-                            // Large font = likely price
                             if (fontSize >= 20) score += 3;
                             if (fontSize >= 16) score += 1;
-                            // Has TK symbol
                             if (text.includes('৳') || text.includes('TK')) score += 2;
                             
                             if (score > bestScore) {
@@ -188,14 +214,14 @@ def scrape_daraz(url):
                         ))].sort((a, b) => a - b);
                         
                         if (amounts.length >= 2) {
-                            price = '৳' + amounts[0]; // Lowest is current price
+                            price = '৳' + amounts[0];
                         } else if (amounts.length === 1) {
                             price = '৳' + amounts[0];
                         }
                     }
                 }
                 
-                // ===== ORIGINAL PRICE =====
+                // Original Price
                 let originalPrice = getText([
                     'span.pdp-price_color_lightgray',
                     'del.pdp-price',
@@ -203,7 +229,6 @@ def scrape_daraz(url):
                     '.pdp-price_original'
                 ]);
                 
-                // Find strikethrough price
                 if (!originalPrice) {
                     const delElements = document.querySelectorAll('del, s, strike, span[style*="line-through"]');
                     for (let el of delElements) {
@@ -215,7 +240,7 @@ def scrape_daraz(url):
                     }
                 }
                 
-                // ===== DISCOUNT =====
+                // Discount
                 let discount = getText([
                     'span.pdp-product-price__discount',
                     '.pdp-product-price__discount',
@@ -223,7 +248,6 @@ def scrape_daraz(url):
                     'span[class*="discount"]'
                 ]);
                 
-                // Calculate discount if not found
                 if (!discount && price && originalPrice) {
                     const p = parseFloat(price.replace(/[^0-9.]/g, ''));
                     const o = parseFloat(originalPrice.replace(/[^0-9.]/g, ''));
@@ -232,7 +256,7 @@ def scrape_daraz(url):
                     }
                 }
                 
-                // ===== BRAND =====
+                // Brand
                 let brand = getText([
                     'a.pdp-product-brand',
                     'span.pdp-product-brand__name',
@@ -240,16 +264,13 @@ def scrape_daraz(url):
                     '.pdp-product-brand'
                 ]);
                 
-                // Clean brand text
                 if (brand) {
-                    brand = brand.replace(/^Brand:\s*/i, '');   // Remove "Brand:"
-                    brand = brand.split('More')[0].trim();      // Remove "More Products..."
-                    brand = brand.split('  ')[0].trim();        // Remove extra spaces
+                    brand = brand.replace(/^Brand:\s*/i, '');
+                    brand = brand.split('More')[0].trim();
                     if (brand.length > 30) brand = brand.substring(0, 30);
-                    if (brand.toLowerCase() === 'no brand' || brand === '') brand = 'No Brand';
                 }
                 
-                // ===== RATING =====
+                // Rating
                 let rating = getText([
                     'span.pdp-review-summary__average',
                     '.pdp-review-summary__average',
@@ -257,7 +278,7 @@ def scrape_daraz(url):
                     'div[class*="rating"] span'
                 ]);
                 
-                // ===== REVIEW COUNT =====
+                // Review Count
                 let reviewCount = getText([
                     'span.pdp-review-summary__count',
                     '.pdp-review-summary__count',
@@ -265,7 +286,7 @@ def scrape_daraz(url):
                 ]);
                 if (reviewCount) reviewCount = reviewCount.replace(/[^0-9]/g, '');
                 
-                // ===== CATEGORY =====
+                // Category
                 let category = null;
                 const breadcrumbs = document.querySelectorAll(
                     'a.pdp-mod-product-breadcrumb-link, .breadcrumb a, nav[class*="breadcrumb"] a'
@@ -274,7 +295,7 @@ def scrape_daraz(url):
                     category = breadcrumbs[breadcrumbs.length - 1].textContent.trim();
                 }
                 
-                // ===== IMAGE =====
+                // Image
                 let image = '';
                 const metaImg = document.querySelector('meta[property="og:image"]');
                 if (metaImg && metaImg.content) {
@@ -287,26 +308,6 @@ def scrape_daraz(url):
                     if (img && img.src) image = img.src;
                 }
                 
-                // ===== REVIEWS (if available) =====
-                const reviews = [];
-                const reviewElements = document.querySelectorAll(
-                    '.pdp-review-item, .review-item, div[class*="review-item"]'
-                );
-                
-                reviewElements.forEach(el => {
-                    const reviewer = el.querySelector('.reviewer, .review-user, [class*="user"]');
-                    const comment = el.querySelector('.review-content, .review-text, .content');
-                    const stars = el.querySelector('.star, .rating, [class*="star"]');
-                    
-                    if (comment && comment.textContent.trim()) {
-                        reviews.push({
-                            reviewer: reviewer ? reviewer.textContent.trim() : 'Customer',
-                            comment: comment.textContent.trim().substring(0, 150),
-                            rating: stars ? stars.textContent.trim() : ''
-                        });
-                    }
-                });
-                
                 return {
                     title: title || 'N/A',
                     price: price || 'N/A',
@@ -316,8 +317,7 @@ def scrape_daraz(url):
                     review_count: reviewCount || 'N/A',
                     brand: brand || 'N/A',
                     category: category || 'N/A',
-                    image: image,
-                    reviews: reviews.slice(0, 3)
+                    image: image
                 };
             }""")
             
@@ -326,20 +326,7 @@ def scrape_daraz(url):
             elapsed = time.time() - start_time
             data['url'] = current_url
             
-            print(f"""
-✅ SCRAPING COMPLETE
-⏱ Time: {elapsed:.1f}s
-📦 Title: {str(data.get('title'))[:60]}
-💰 Price: {data.get('price')}
-🏷️ Original: {data.get('original_price')}
-🔥 Discount: {data.get('discount')}
-⭐ Rating: {data.get('rating')} | Reviews: {data.get('review_count')}
-🏭 Brand: {data.get('brand')}
-📂 Category: {data.get('category')}
-🖼 Image: {data.get('image', '')[:50]}...
-💬 Reviews found: {len(data.get('reviews', []))}
-{'='*50}
-            """)
+            print(f"✅ Done in {elapsed:.1f}s | Price: {data.get('price')} | Discount: {data.get('discount')}")
             
             return data
             
@@ -350,6 +337,9 @@ def scrape_daraz(url):
         return {'error': str(e)}
 
 
+# ============================================
+# HOMEPAGE
+# ============================================
 @app.route('/')
 def home():
     return '''
@@ -363,26 +353,15 @@ def home():
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            background: linear-gradient(135deg, #f57224 0%, #ff6b35 100%); 
             min-height: 100vh; 
             padding: 20px; 
         }
         .container { max-width: 650px; margin: 0 auto; }
         
-        .header { 
-            text-align: center; 
-            margin-bottom: 25px; 
-            color: white; 
-        }
-        .header h1 { 
-            font-size: 28px; 
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.2); 
-        }
-        .header p { 
-            font-size: 14px; 
-            opacity: 0.9; 
-            margin-top: 5px; 
-        }
+        .header { text-align: center; margin-bottom: 25px; color: white; }
+        .header h1 { font-size: 28px; text-shadow: 2px 2px 4px rgba(0,0,0,0.2); }
+        .header p { font-size: 14px; opacity: 0.9; margin-top: 5px; }
         
         .search-box { 
             background: white; 
@@ -398,38 +377,26 @@ def home():
             border: 2px solid #e0e0e0; 
             border-radius: 10px; 
             font-size: 14px; 
-            transition: all 0.3s; 
         }
         input:focus { 
             outline: none; 
-            border-color: #667eea; 
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1); 
+            border-color: #f57224; 
+            box-shadow: 0 0 0 3px rgba(245,114,36,0.1); 
         }
         button { 
             padding: 14px 25px; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+            background: linear-gradient(135deg, #f57224, #ff6b35); 
             color: white; 
             border: none; 
             border-radius: 10px; 
             font-size: 15px; 
             font-weight: bold; 
             cursor: pointer; 
-            transition: transform 0.2s, box-shadow 0.2s; 
             white-space: nowrap; 
         }
-        button:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4); 
-        }
-        button:active { transform: translateY(0); }
+        button:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(245,114,36,0.4); }
         
-        .quick-links { 
-            margin-top: 12px; 
-            display: flex; 
-            gap: 8px; 
-            flex-wrap: wrap; 
-            align-items: center; 
-        }
+        .quick-links { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
         .quick-btn { 
             background: #f5f5f5; 
             border: 1px solid #ddd; 
@@ -437,20 +404,10 @@ def home():
             border-radius: 20px; 
             font-size: 12px; 
             cursor: pointer; 
-            transition: all 0.2s; 
         }
-        .quick-btn:hover { 
-            background: #667eea; 
-            color: white; 
-            border-color: #667eea; 
-        }
+        .quick-btn:hover { background: #f57224; color: white; border-color: #f57224; }
         
-        .loading { 
-            text-align: center; 
-            padding: 30px; 
-            display: none; 
-            color: white; 
-        }
+        .loading { text-align: center; padding: 30px; display: none; color: white; }
         .spinner { 
             border: 4px solid rgba(255,255,255,0.3); 
             border-top: 4px solid white; 
@@ -460,10 +417,7 @@ def home():
             animation: spin 0.8s linear infinite; 
             margin: 0 auto 15px; 
         }
-        @keyframes spin { 
-            0% { transform: rotate(0deg); } 
-            100% { transform: rotate(360deg); } 
-        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         
         .error { 
             background: #fff0f0; 
@@ -473,7 +427,6 @@ def home():
             display: none; 
             margin-bottom: 20px; 
             color: #d00; 
-            font-weight: 500; 
         }
         
         .product { display: none; animation: slideUp 0.5s ease; }
@@ -489,156 +442,40 @@ def home():
             overflow: hidden; 
         }
         
-        .img-section { 
-            background: #fafafa; 
-            padding: 25px; 
-            text-align: center; 
-            position: relative; 
-        }
-        .product-img { 
-            max-width: 100%; 
-            max-height: 300px; 
-            object-fit: contain; 
-            border-radius: 10px; 
-        }
+        .img-section { background: #fafafa; padding: 25px; text-align: center; position: relative; }
+        .product-img { max-width: 100%; max-height: 300px; object-fit: contain; border-radius: 10px; }
         .disc-badge { 
-            position: absolute; 
-            top: 15px; 
-            right: 15px; 
-            background: #ff4444; 
-            color: white; 
-            padding: 8px 15px; 
-            border-radius: 25px; 
-            font-weight: bold; 
-            font-size: 14px; 
-            box-shadow: 0 2px 10px rgba(255,68,68,0.3); 
-            display: none; 
+            position: absolute; top: 15px; right: 15px; 
+            background: #ff4444; color: white; padding: 8px 15px; 
+            border-radius: 25px; font-weight: bold; font-size: 14px; display: none; 
         }
         
         .details { padding: 25px; }
-        .brand { 
-            color: #667eea; 
-            font-weight: 600; 
-            font-size: 14px; 
-            margin-bottom: 8px; 
-        }
-        .title { 
-            font-size: 20px; 
-            font-weight: bold; 
-            color: #333; 
-            margin-bottom: 15px; 
-            line-height: 1.5; 
-        }
+        .brand { color: #f57224; font-weight: 600; font-size: 14px; margin-bottom: 8px; }
+        .title { font-size: 20px; font-weight: bold; color: #333; margin-bottom: 15px; line-height: 1.5; }
         
         .price-box { 
-            background: linear-gradient(135deg, #f8f9ff, #f0f0ff); 
-            padding: 18px; 
-            border-radius: 12px; 
-            margin-bottom: 15px; 
-            display: flex; 
-            align-items: center; 
-            flex-wrap: wrap; 
-            gap: 12px; 
+            background: #fff5f0; padding: 18px; border-radius: 12px; 
+            margin-bottom: 15px; display: flex; align-items: center; flex-wrap: wrap; gap: 12px; 
         }
-        .price { 
-            font-size: 32px; 
-            font-weight: bold; 
-            color: #667eea; 
-        }
-        .orig-price { 
-            color: #999; 
-            text-decoration: line-through; 
-            font-size: 16px; 
-            display: none; 
-        }
-        .disc-text { 
-            color: #ff4444; 
-            font-weight: bold; 
-            font-size: 15px; 
-            display: none; 
-        }
+        .price { font-size: 32px; font-weight: bold; color: #f57224; }
+        .orig-price { color: #999; text-decoration: line-through; font-size: 16px; display: none; }
+        .disc-text { color: #ff4444; font-weight: bold; font-size: 15px; display: none; }
         
-        .stats { 
-            display: grid; 
-            grid-template-columns: 1fr 1fr 1fr 1fr; 
-            gap: 10px; 
-            margin-bottom: 15px; 
-        }
-        .stat { 
-            background: #f8f9fa; 
-            padding: 12px; 
-            border-radius: 10px; 
-            text-align: center; 
-        }
-        .stat-label { 
-            font-size: 10px; 
-            color: #888; 
-            margin-bottom: 5px; 
-            text-transform: uppercase; 
-        }
-        .stat-value { 
-            font-size: 14px; 
-            font-weight: bold; 
-            color: #333; 
-        }
-        
-        .reviews-box { 
-            background: #fafafa; 
-            border-radius: 10px; 
-            padding: 15px; 
-            margin-bottom: 15px; 
-            display: none; 
-        }
-        .reviews-title { 
-            font-size: 14px; 
-            font-weight: bold; 
-            color: #333; 
-            margin-bottom: 10px; 
-        }
-        .review-item { 
-            background: white; 
-            padding: 12px; 
-            border-radius: 8px; 
-            margin-bottom: 8px; 
-            border-left: 3px solid #667eea; 
-        }
-        .review-header { 
-            display: flex; 
-            justify-content: space-between; 
-            margin-bottom: 5px; 
-            font-size: 12px; 
-        }
-        .reviewer { font-weight: 600; color: #333; }
-        .review-stars { color: #f59e0b; }
-        .review-text { 
-            font-size: 13px; 
-            color: #666; 
-            line-height: 1.5; 
-        }
+        .stats { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }
+        .stat { background: #f8f9fa; padding: 12px; border-radius: 10px; text-align: center; }
+        .stat-label { font-size: 10px; color: #888; margin-bottom: 5px; }
+        .stat-value { font-size: 14px; font-weight: bold; color: #333; }
         
         .buy-btn { 
-            display: block; 
-            text-align: center; 
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-            color: white; 
-            padding: 16px; 
-            border-radius: 12px; 
-            text-decoration: none; 
-            font-size: 17px; 
-            font-weight: bold; 
-            transition: transform 0.2s, box-shadow 0.2s; 
+            display: block; text-align: center; 
+            background: linear-gradient(135deg, #f57224, #ff6b35); 
+            color: white; padding: 16px; border-radius: 12px; 
+            text-decoration: none; font-size: 17px; font-weight: bold; 
         }
-        .buy-btn:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4); 
-        }
+        .buy-btn:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(245,114,36,0.4); }
         
-        .time { 
-            text-align: center; 
-            margin-top: 10px; 
-            font-size: 12px; 
-            color: #888; 
-        }
+        .time { text-align: center; margin-top: 10px; font-size: 12px; color: #888; }
         
         @media (max-width: 600px) {
             .stats { grid-template-columns: 1fr 1fr; }
@@ -650,39 +487,33 @@ def home():
     <div class="container">
         <div class="header">
             <h1>🛍️ Daraz Product Viewer</h1>
-            <p>Paste any Daraz link & get full product details instantly</p>
+            <p>Paste any Daraz link & get full product details</p>
         </div>
         
         <div class="search-box">
             <div class="input-row">
-                <input type="text" id="urlInput" placeholder="Paste Daraz product or affiliate link here..." autofocus>
+                <input type="text" id="urlInput" placeholder="Paste Daraz product or affiliate link..." autofocus>
                 <button onclick="searchProduct()">🔍 Search</button>
             </div>
             <div class="quick-links">
-                <span style="font-size:12px; color:#888;">Quick Test:</span>
+                <span style="font-size:12px; color:#888;">Quick:</span>
                 <button class="quick-btn" onclick="quickSearch('https://s.daraz.com.bd/s.bMhlC?cc')">⌚ Watch</button>
                 <button class="quick-btn" onclick="quickSearch('https://www.daraz.com.bd/products/realme-c55-8gb-256gb-i405584532.html')">📱 Phone</button>
-                <button class="quick-btn" onclick="quickSearch('https://www.daraz.com.bd/products/samsung-galaxy-s24-i384567890.html')">📱 Samsung</button>
             </div>
         </div>
         
-        <div class="loading" id="loading">
-            <div class="spinner"></div>
-            <p style="font-size:14px;">Loading product details...</p>
-        </div>
-        
+        <div class="loading" id="loading"><div class="spinner"></div><p>Loading product details...</p></div>
         <div class="error" id="error"></div>
         
         <div class="product" id="product">
             <div class="product-card">
                 <div class="img-section">
-                    <img class="product-img" id="pImg" src="" alt="Product Image" onerror="this.style.display='none'">
+                    <img class="product-img" id="pImg" src="" onerror="this.style.display='none'">
                     <div class="disc-badge" id="pDiscBadge"></div>
                 </div>
-                
                 <div class="details">
                     <div class="brand" id="pBrand"></div>
-                    <h2 class="title" id="pTitle">Loading...</h2>
+                    <h2 class="title" id="pTitle"></h2>
                     
                     <div class="price-box">
                         <span class="price" id="pPrice">N/A</span>
@@ -691,32 +522,13 @@ def home():
                     </div>
                     
                     <div class="stats">
-                        <div class="stat">
-                            <div class="stat-label">⭐ Rating</div>
-                            <div class="stat-value" id="pRating">-</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-label">📝 Reviews</div>
-                            <div class="stat-value" id="pReviews">-</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-label">🏷️ Brand</div>
-                            <div class="stat-value" id="pBrandVal">-</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-label">📂 Category</div>
-                            <div class="stat-value" id="pCategory">-</div>
-                        </div>
+                        <div class="stat"><div class="stat-label">⭐ Rating</div><div class="stat-value" id="pRating">-</div></div>
+                        <div class="stat"><div class="stat-label">📝 Reviews</div><div class="stat-value" id="pReviews">-</div></div>
+                        <div class="stat"><div class="stat-label">🏷️ Brand</div><div class="stat-value" id="pBrandVal">-</div></div>
+                        <div class="stat"><div class="stat-label">📂 Category</div><div class="stat-value" id="pCategory">-</div></div>
                     </div>
                     
-                    <div class="reviews-box" id="reviewsBox">
-                        <div class="reviews-title">💬 Recent Customer Reviews</div>
-                        <div id="reviewsList"></div>
-                    </div>
-                    
-                    <a class="buy-btn" id="pBuy" href="#" target="_blank">
-                        🛒 Buy Now on Daraz
-                    </a>
+                    <a class="buy-btn" id="pBuy" href="#" target="_blank">🛒 Buy Now on Daraz</a>
                     <div class="time" id="pTime"></div>
                 </div>
             </div>
@@ -727,7 +539,6 @@ def home():
         async function searchProduct() {
             const url = document.getElementById('urlInput').value.trim();
             if (!url) return alert('Please enter a Daraz URL');
-            if (!url.includes('daraz')) return alert('Please enter a valid Daraz URL');
             fetchProduct(url);
         }
         
@@ -738,8 +549,6 @@ def home():
         
         async function fetchProduct(url) {
             const startTime = Date.now();
-            
-            // Show loading
             document.getElementById('loading').style.display = 'block';
             document.getElementById('product').style.display = 'none';
             document.getElementById('error').style.display = 'none';
@@ -749,62 +558,44 @@ def home():
                 const data = await response.json();
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 
-                // Hide loading
                 document.getElementById('loading').style.display = 'none';
                 
-                // Handle error
                 if (data.error) {
                     document.getElementById('error').textContent = '❌ ' + data.error;
                     document.getElementById('error').style.display = 'block';
                     return;
                 }
                 
-                // Display product image
-                if (data.image) {
-                    document.getElementById('pImg').src = data.image;
-                    document.getElementById('pImg').style.display = 'block';
-                } else {
-                    document.getElementById('pImg').style.display = 'none';
+                if (data.image) { 
+                    document.getElementById('pImg').src = data.image; 
+                    document.getElementById('pImg').style.display = 'block'; 
                 }
                 
-                // Basic info
                 document.getElementById('pTitle').textContent = data.title || 'N/A';
                 document.getElementById('pPrice').textContent = data.price || 'N/A';
                 document.getElementById('pBuy').href = data.url || url;
                 document.getElementById('pTime').textContent = '⚡ Loaded in ' + elapsed + ' seconds';
                 
-                // Brand
-                if (data.brand && data.brand !== 'N/A' && data.brand !== 'No Brand') {
+                if (data.brand && data.brand !== 'N/A') {
                     document.getElementById('pBrand').textContent = '🏷️ ' + data.brand;
                     document.getElementById('pBrandVal').textContent = data.brand;
                 } else {
                     document.getElementById('pBrand').textContent = '';
-                    document.getElementById('pBrandVal').textContent = 'No Brand';
+                    document.getElementById('pBrandVal').textContent = '-';
                 }
                 
-                // Rating
-                document.getElementById('pRating').textContent = 
-                    data.rating && data.rating !== 'N/A' ? '⭐ ' + data.rating : '-';
+                document.getElementById('pRating').textContent = data.rating !== 'N/A' ? '⭐ ' + data.rating : '-';
+                document.getElementById('pReviews').textContent = data.review_count !== 'N/A' ? data.review_count : '0';
+                document.getElementById('pCategory').textContent = data.category !== 'N/A' ? data.category : '-';
                 
-                // Reviews count
-                document.getElementById('pReviews').textContent = 
-                    data.review_count && data.review_count !== 'N/A' ? data.review_count : '0';
-                
-                // Category
-                document.getElementById('pCategory').textContent = 
-                    data.category && data.category !== 'N/A' ? data.category : '-';
-                
-                // Original price
-                if (data.original_price && data.original_price !== 'N/A' && 
-                    data.original_price !== data.price) {
+                if (data.original_price && data.original_price !== 'N/A' && data.original_price !== data.price) {
                     document.getElementById('pOrig').textContent = data.original_price;
                     document.getElementById('pOrig').style.display = 'inline';
                 } else {
                     document.getElementById('pOrig').style.display = 'none';
                 }
                 
-                // Discount
-                if (data.discount && data.discount !== 'N/A' && data.discount !== '0%') {
+                if (data.discount && data.discount !== 'N/A') {
                     document.getElementById('pDisc').textContent = '🔥 ' + data.discount;
                     document.getElementById('pDisc').style.display = 'inline';
                     document.getElementById('pDiscBadge').textContent = data.discount;
@@ -814,42 +605,18 @@ def home():
                     document.getElementById('pDiscBadge').style.display = 'none';
                 }
                 
-                // Reviews
-                if (data.reviews && data.reviews.length > 0) {
-                    document.getElementById('reviewsBox').style.display = 'block';
-                    document.getElementById('reviewsList').innerHTML = data.reviews.map(r => `
-                        <div class="review-item">
-                            <div class="review-header">
-                                <span class="reviewer">👤 ${r.reviewer || 'Customer'}</span>
-                                <span class="review-stars">${r.rating ? '⭐ ' + r.rating : ''}</span>
-                            </div>
-                            <div class="review-text">${r.comment || ''}</div>
-                        </div>
-                    `).join('');
-                } else {
-                    document.getElementById('reviewsBox').style.display = 'none';
-                }
-                
-                // Show product
                 document.getElementById('product').style.display = 'block';
-                document.getElementById('product').scrollIntoView({ behavior: 'smooth', block: 'start' });
+                document.getElementById('product').scrollIntoView({ behavior: 'smooth' });
                 
             } catch (err) {
                 document.getElementById('loading').style.display = 'none';
                 document.getElementById('error').textContent = '❌ Network error: ' + err.message;
                 document.getElementById('error').style.display = 'block';
-                console.error('Fetch error:', err);
             }
         }
         
-        // Enter key support
         document.getElementById('urlInput').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') searchProduct();
-        });
-        
-        // Auto-focus on load
-        window.addEventListener('load', function() {
-            document.getElementById('urlInput').focus();
         });
     </script>
 </body>
@@ -857,9 +624,11 @@ def home():
     '''
 
 
+# ============================================
+# API ENDPOINT
+# ============================================
 @app.route('/api/product')
 def api_product():
-    """API endpoint for product scraping"""
     url = request.args.get('url', '').strip()
     
     if not url:
@@ -872,24 +641,36 @@ def api_product():
     return jsonify(result)
 
 
+# ============================================
+# HEALTH CHECK
+# ============================================
+@app.route('/health')
+def health():
+    return jsonify({'status': 'ok'})
+
+
+# ============================================
+# ERROR HANDLERS
+# ============================================
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({'error': 'Endpoint not found'}), 404
-
+    return jsonify({'error': 'Not found'}), 404
 
 @app.errorhandler(500)
 def server_error(e):
     return jsonify({'error': 'Internal server error'}), 500
 
 
+# ============================================
+# MAIN
+# ============================================
 if __name__ == '__main__':
-    import os
     port = int(os.environ.get('PORT', 5000))
     print(f"""
-╔══════════════════════════════════════════════╗
-║     🛍️  DARAZ PRODUCT VIEWER                ║
-║     🚀  Playwright Scraper                  ║
-║     📍  Port: {port}                          ║
-╚══════════════════════════════════════════════╝
+╔══════════════════════════════════════════╗
+║   🛍️  DARAZ PRODUCT VIEWER             ║
+║   🚀  Port: {port:<26}║
+║   ✅  Ready                            ║
+╚══════════════════════════════════════════╝
     """)
     app.run(debug=False, host='0.0.0.0', port=port, threaded=True)
